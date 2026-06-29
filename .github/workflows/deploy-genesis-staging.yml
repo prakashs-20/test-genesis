@@ -1,0 +1,227 @@
+name: Deploy genesis-prod-staging (staging)
+
+# Genesis PROD-SHAPED STAGING deployment — Genesis runs THIS workflow against THEIR
+# OWN AWS account (the SAME single account as genesis-prod) to bring up + update the
+# staging copy of the Axira platform hands-off. It is the staging sibling of
+# deploy-genesis-production.yml: same RC-tag-driven, verify-gate -> reusable
+# _deploy-genesis-standalone.yml shape, same STANDALONE no-monorepo mechanics, run by
+# Genesis from the SAME delivered ZIP. The only differences are the target env and
+# its GitHub config:
+#
+#   • env_name: genesis-prod-staging — staging-TIER resources (small Aurora/Redis/
+#     OpenSearch, single-AZ), prod-SHAPED edge (VPN private-access, internal ALB,
+#     genesiscapital.com domain, imported ACM cert). Coexists with genesis-prod in
+#     the one account (env-prefixed resources; VPC 10.41/16 vs prod 10.40/16).
+#   • CDK vars are the staging-scoped CDK_GENESIS_PROD_STAGING_* set (account may be
+#     the SAME Genesis account id as prod; the reusable maps them to the env's var
+#     prefix automatically).
+#   • Auth0 = Axira's DEV/STAGING tenant — NOT a code field; it is whatever
+#     `.auth0.domain` the staging seed (GENESIS_STAGING_SECRETS_JSON) carries.
+#   • Sign-in is still locked to genesiscapital.com (instance_email_domain).
+#
+# Staging ships the SAME cosign-signed RC image bytes as prod (the `verify` job does
+# EXACTLY what Genesis does on pull before the deploy handoff). Empty rc_tag fails
+# fast.
+#
+# Required GitHub config (repo or `genesis-prod-staging` environment scope):
+#   vars.CDK_GENESIS_PROD_STAGING_ACCOUNT      12-digit Genesis AWS account id (same account as prod)
+#   vars.AWS_REGION                            deploy region (default us-west-2)
+#   vars.CDK_GENESIS_PROD_STAGING_VPN_CIDRS    comma-separated VPN/VPC CIDR(s) -> internal ALB
+#   vars.CDK_GENESIS_PROD_STAGING_ALB_CERT_ARN ACM cert ARN (deploy region, apex + *.apex)
+#   vars.CDK_GENESIS_PROD_STAGING_WILDCARD_CERT_ARN  (optional) extra SNI cert for admin host
+#   secrets.AWS_DEPLOY_ROLE                    Genesis OIDC deploy-role ARN
+#   secrets.JFROG_USER / JFROG_TOKEN           genesis-readonly JFrog pull creds
+#   secrets.COSIGN_INTERNAL_PUBLIC_KEY         genesis cosign PUBLIC key (verify signatures)
+#   secrets.GENESIS_STAGING_SECRETS_JSON       Auth0 values for the DEV/STAGING tenant (Axira supplies; Genesis stores)
+#   vars.JFROG_REGISTRY / vars.JFROG_REPO / vars.PROD_PULL_REPO  (optional overrides)
+#
+# Manual approval gate: add required reviewers to the GitHub `genesis-prod-staging`
+# environment — the reusable workflow's `cdk` job (first AWS-touching job) then pauses
+# for sign-off. Leave unset for fully-unattended deploys.
+
+on:
+  # Genesis staging deploy is MANUAL / RC-tag-driven — supply the RC checkpoint tag.
+  # Run AFTER that RC's signed images are in JFrog.
+  workflow_dispatch:
+    inputs:
+      rc_tag:
+        description: "RC tag to deploy (format: vMAJOR.MINOR.PATCH-rcN, e.g. v1.0.0-rc1). The :<rc_tag> images must already be published to JFrog. No staging-head fallback."
+        required: true
+        type: string
+
+concurrency:
+  group: deploy-genesis-prod-staging
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+  actions: read
+
+jobs:
+  resolve:
+    name: Resolve RC tag
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.pick.outputs.sha }}
+      proceed: ${{ steps.pick.outputs.proceed }}
+    steps:
+      - name: Require an explicit RC tag (no staging-head fallback)
+        id: pick
+        env:
+          RC_TAG: ${{ github.event.inputs.rc_tag }}
+        run: |
+          set -euo pipefail
+          if [ -z "${RC_TAG:-}" ]; then
+            echo "::error::rc_tag is required — Genesis staging deploys the RC checkpoint :<rc_tag> from JFrog, with no staging-head fallback."
+            exit 1
+          fi
+          # `sha` is the reusable workflow's input name; it carries the RC tag
+          # (a valid checkout ref + image tag) end-to-end.
+          echo "sha=$RC_TAG" >> "$GITHUB_OUTPUT"
+          echo "proceed=true" >> "$GITHUB_OUTPUT"
+          echo "candidate genesis-prod-staging RC tag: $RC_TAG"
+      - name: Verify cosign-signed images exist in JFrog
+        if: ${{ steps.pick.outputs.proceed == 'true' }}
+        env:
+          TAG: ${{ steps.pick.outputs.sha }}
+          REG: ${{ vars.JFROG_REGISTRY || 'axiralabs.jfrog.io' }}
+          # Genesis pulls the customer VIRTUAL repo by default (axira-images).
+          REPO: ${{ vars.PROD_PULL_REPO || vars.JFROG_REPO || 'axira-images' }}
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.JFROG_TOKEN }}" | docker login "$REG" -u "${{ secrets.JFROG_USER }}" --password-stdin
+          miss=""
+          # Same customer-deployed service set as the RC build. teams-bot excluded
+          # (Teams integration not shipped for now).
+          for s in gateway experience agent-runtime workflow-engine admin-hub observability-alert-runner; do
+            docker buildx imagetools inspect "$REG/$REPO/axira-$s:$TAG" >/dev/null 2>&1 || miss="$miss axira-$s"
+          done
+          if [ -n "$miss" ]; then echo "::error::signed RC images missing in JFrog at :$TAG —$miss. Publish the RC first."; exit 1; fi
+
+  verify:
+    name: Staging verify gate — Genesis pull (${{ matrix.service }})
+    needs: [resolve]
+    if: ${{ needs.resolve.outputs.proceed == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: true
+      matrix:
+        service:
+          - gateway
+          - workflow-engine
+          - agent-runtime
+          - experience
+          - admin-hub
+          - observability-alert-runner
+    env:
+      REG: ${{ vars.JFROG_REGISTRY || 'axiralabs.jfrog.io' }}
+      REPO: ${{ vars.PROD_PULL_REPO || vars.JFROG_REPO || 'axira-images' }}
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      # cosign-installer@v3 with NO cosign-release pin (matches the signer).
+      - uses: sigstore/cosign-installer@v3
+      - name: Log in to JFrog (Genesis pull repo)
+        run: |
+          echo "${{ secrets.JFROG_TOKEN }}" | docker login "$REG" -u "${{ secrets.JFROG_USER }}" --password-stdin
+      - name: Pull, cosign-verify, and read SBOM + provenance (exactly what Genesis does)
+        env:
+          SVC: ${{ matrix.service }}
+          TAG: ${{ needs.resolve.outputs.sha }}
+          COSIGN_INTERNAL_PUBLIC_KEY: ${{ secrets.COSIGN_INTERNAL_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          IMG="$REG/$REPO/axira-$SVC:$TAG"
+          echo "::group::verify $IMG"
+          if ! docker buildx imagetools inspect "$IMG" >/dev/null 2>&1; then
+            echo "::error::$IMG not found in $REPO — publish the RC first."
+            exit 1
+          fi
+          docker pull "$IMG" >/dev/null
+          if [ -z "${COSIGN_INTERNAL_PUBLIC_KEY:-}" ]; then
+            echo "::error::COSIGN_INTERNAL_PUBLIC_KEY not set — refusing to deploy unverified images."
+            exit 1
+          fi
+          # Verify the TAG (resolves to the signed INDEX), NOT a per-arch digest.
+          # --insecure-ignore-tlog=true is expected (Axira-managed key, not keyless).
+          cosign verify \
+            --key env://COSIGN_INTERNAL_PUBLIC_KEY \
+            --insecure-ignore-tlog=true \
+            "$IMG"
+          docker buildx imagetools inspect "$IMG" --format '{{ json .SBOM }}' \
+            | jq -e '.SPDX.spdxVersion' >/dev/null \
+            || { echo "::error::SPDX SBOM missing on $IMG"; exit 1; }
+          docker buildx imagetools inspect "$IMG" --format '{{ json .Provenance }}' \
+            | jq -e '. != null and . != {}' >/dev/null \
+            || { echo "::error::SLSA provenance missing on $IMG"; exit 1; }
+          echo "verified $IMG (cosign signature ok; SBOM + provenance present)"
+          echo "::endgroup::"
+
+  check-current:
+    name: Skip if staging already at candidate
+    needs: [resolve, verify]
+    if: ${{ needs.resolve.outputs.proceed == 'true' }}
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.c.outputs.changed }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE }}
+          aws-region: ${{ vars.AWS_REGION || 'us-west-2' }}
+      - name: Compare running staging image to candidate RC tag
+        id: c
+        env:
+          SHA: ${{ needs.resolve.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # Cluster is axira-<env_name> -> axira-genesis-prod-staging; gateway service is
+          # axira-<env_name>-gateway -> axira-genesis-prod-staging-gateway.
+          cur=$(aws ecs describe-services --cluster axira-genesis-prod-staging --services axira-genesis-prod-staging-gateway \
+            --query 'services[0].taskDefinition' --output text 2>/dev/null || echo "")
+          if [ -z "$cur" ] || [ "$cur" = "None" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"; echo "staging gateway not found — will deploy"; exit 0
+          fi
+          img=$(aws ecs describe-task-definition --task-definition "$cur" \
+            --query "taskDefinition.containerDefinitions[?contains(image,'axira-gateway')].image | [0]" --output text)
+          echo "current staging gateway image: $img"
+          case "$img" in
+            *":$SHA") echo "changed=false" >> "$GITHUB_OUTPUT"; echo "already at RC tag $SHA — no-op" ;;
+            *)        echo "changed=true"  >> "$GITHUB_OUTPUT" ;;
+          esac
+
+  deploy:
+    # `verify` (the Genesis-mimicking cosign + SBOM/provenance gate) must pass for
+    # EVERY service before any staging change ships.
+    needs: [resolve, verify, check-current]
+    if: ${{ needs.resolve.outputs.proceed == 'true' && needs.check-current.outputs.changed == 'true' }}
+    # STANDALONE deploy mechanics — the SAME reusable Genesis runs for prod. ZERO
+    # monorepo dependency: it installs ONLY infra's own deps and `cdk deploy`s the
+    # env, which omits the sole build-from-source stack (UserProfileRefreshStack) in
+    # the delivered bundle. env_name=genesis-prod-staging selects the staging env.
+    uses: ./.github/workflows/_deploy-genesis-standalone.yml
+    secrets: inherit
+    with:
+      env_name: genesis-prod-staging
+      cluster: axira-genesis-prod-staging
+      # The RC tag is an IMAGE tag here (pull from JFrog → mirror to ECR), NOT a
+      # git checkout ref — the standalone workflow checks out the bundle's own code.
+      image_tag: ${{ needs.resolve.outputs.sha }}
+      # Genesis pulls the customer VIRTUAL repo for the ECR mirror.
+      source_repo: ${{ vars.PROD_PULL_REPO || vars.JFROG_REPO || 'axira-images' }}
+      # Genesis's OWN account (the SAME account as prod) + region. The reusable maps
+      # these onto the staging var prefix (CDK_GENESIS_PROD_STAGING_*) automatically.
+      account: ${{ vars.CDK_GENESIS_PROD_STAGING_ACCOUNT }}
+      region: ${{ vars.AWS_REGION || 'us-west-2' }}
+      # PRIVATE ACCESS over Genesis's OWN VPN — vpn mode (internal ALB); no cloudflared
+      # stack, no Axira DNS. Genesis points their own Route 53 at the ALB via the
+      # AlbDnsName CfnOutput.
+      vpn_cidrs: ${{ vars.CDK_GENESIS_PROD_STAGING_VPN_CIDRS }}
+      alb_cert_arn: ${{ vars.CDK_GENESIS_PROD_STAGING_ALB_CERT_ARN }}
+      wildcard_cert_arn: ${{ vars.CDK_GENESIS_PROD_STAGING_WILDCARD_CERT_ARN }}
+      # Single-customer staging: lock sign-in to Genesis's corporate email domain.
+      instance_email_domain: genesiscapital.com
+      canary: true
+      rollback_on_failure: true
+      notify: true

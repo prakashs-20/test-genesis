@@ -1,0 +1,6 @@
+# Lambda runtime already bundles boto3 + botocore — listed here only to
+# document the runtime dependency. CDK Code.fromAsset() does NOT install
+# from this file at deploy time; it just zips the directory contents.
+# If we ever add a dep not in the Lambda runtime, switch to a Lambda Layer
+# or a CDK PythonFunction (which DOES pip-install).
+boto3>=1.34

@@ -1,0 +1,768 @@
+name: _deploy-genesis-standalone (reusable)
+
+# STANDALONE deploy mechanics for the customer-delivered Genesis environments.
+# Parameterized by `env_name` (genesis-prod | genesis-prod-staging) so Genesis runs
+# BOTH their prod AND their staging env themselves from the SAME delivered ZIP — same
+# no-monorepo path, same jobs. env_name drives `-c env=`, the CDK_GENESIS_* var prefix
+# (genesis-prod => CDK_GENESIS_PROD_*, genesis-prod-staging => CDK_GENESIS_PROD_STAGING_*),
+# the seed secret (GENESIS_PROD_SECRETS_JSON vs GENESIS_STAGING_SECRETS_JSON), and the
+# GitHub Environment. genesis-prod is the default and is unchanged in effect.
+#
+# Unlike _deploy-los.yml (which deploys the Axira-owned axira-los[-staging] envs
+# FROM the monorepo), this workflow has ZERO monorepo dependency. It is shipped to
+# Genesis inside a ZIP that contains ONLY infra/ (CDK + a standalone lockfile),
+# the standalone deploy scripts, and the Auth0 Action snippets — NEVER apps/ or
+# packages/. The 5 service images live solely in JFrog. Accordingly this workflow:
+#
+#   • runs NO `pnpm install --frozen-lockfile` at a repo root, and
+#   • runs NO `pnpm --filter @axira/* build`.
+# It installs ONLY infra's own (all-public) dependencies via a plain install
+# against infra/'s standalone lockfile, then `cdk deploy`s the customer env.
+#
+# Why this is even possible: the genesis-prod CDK env OMITS the sole
+# build-from-source stack (UserProfileRefreshStack — its NodejsFunction bundles
+# apps/user-profile-refresh-lambda + workspace deps from the monorepo root). With
+# that stack gated off (infra/bin/axira-staging.ts: `env.name !== "genesis-prod"`),
+# the whole CDK app synthesizes against infra/ alone. See GENESIS-PROD-HANDOVER.md.
+#
+# IMAGE-BASED, COSIGN-VERIFIED: the 5 customer services run the EXACT cosign-signed
+# RC bytes promoted into Genesis's JFrog virtual repo (axira-images). Every image is
+# cosign-VERIFIED against the GENESIS public key before it is mirrored into ECR, and
+# DB migrations ship BAKED INTO the gateway image (apps/gateway/Dockerfile copies
+# migrations/ + scripts/migrate.mjs) — so NO SQL and NO app source ever ships in the
+# bundle. migrate runs as a one-off ECS task on that gateway image.
+#
+# CHECKOUT vs IMAGE TAG — a deliberate split (this is the key bundle difference vs
+# _deploy-los.yml, which conflates them): the workflow checks out the bundle's OWN
+# committed code (the default ref — the infra/ + scripts/ Genesis received), while
+# `image_tag` is used ONLY to pull the RC images from JFrog/ECR. The RC tag is an
+# IMAGE tag, never a git ref in Genesis's repo.
+#
+# Stages (mirror _deploy-los.yml, minus the monorepo build steps):
+#   cdk          — detect fresh env; fresh => placeholder bootstrap, else diff-only
+#   mirror       — cosign-VERIFY each signed JFrog image vs the GENESIS key, mirror
+#                  to ECR @<image_tag> (+ seed :latest on first deploy)
+#   seed_secrets — populate auth0 / auth0-m2m / auth0-mgmt shells from the GH seed
+#   migrate      — run the CDK db-migrate task def (gateway image) BEFORE the flip
+#   cdk_finalize — real cdk deploy => real task defs + the flip
+#   auth0_setup  — scripts/setup-auth0-tenant.mjs (Node built-ins only, no install)
+#   roll         — pin each Fargate service to :<image_tag>; optional canary
+#   smoke        — VPC-internal health probe
+#   rollback     — (opt-in) revert to prior task defs on roll/smoke failure
+#   notify       — (opt-in) Slack on success/failure
+#
+# (No WARP DNS job: genesis-prod is vpn-mode — Genesis points THEIR Route 53 at the
+# AlbDnsName CfnOutput. Axira/this pipeline writes no Genesis DNS.)
+
+on:
+  workflow_call:
+    inputs:
+      env_name:
+        description: "CDK env / resource namespace for this standalone deploy: genesis-prod (default) or genesis-prod-staging. Drives -c env=, the CDK_GENESIS_* var prefix, the seed secret, and the GitHub Environment."
+        required: false
+        type: string
+        default: genesis-prod
+      cluster:
+        description: "ECS cluster name (axira-<env_name>), e.g. axira-genesis-prod or axira-genesis-prod-staging."
+        required: false
+        type: string
+        default: axira-genesis-prod
+      image_tag:
+        description: "RC image tag to deploy (e.g. vMAJOR.MINOR.PATCH-rcN, e.g. v1.0.0-rc1). Pulled from JFrog; used as the ECR image tag. NOT a git ref."
+        required: true
+        type: string
+      source_repo:
+        description: "JFrog repo to PULL the signed images from. Default = the customer VIRTUAL repo (axira-images)."
+        required: false
+        type: string
+        default: axira-images
+      region:
+        required: false
+        type: string
+        default: us-west-2
+      account:
+        description: "Genesis's AWS account id. Exported to CDK_GENESIS_PROD[_STAGING]_ACCOUNT (per env_name)."
+        required: true
+        type: string
+      vpn_cidrs:
+        description: "Comma-separated Genesis VPN/VPC CIDR(s) allowed to the internal ALB. Exported to CDK_GENESIS_PROD[_STAGING]_VPN_CIDRS (per env_name)."
+        required: true
+        type: string
+      alb_cert_arn:
+        description: "Genesis-issued ACM cert ARN (deploy region, apex + *.apex) for the ALB :443 listener. Exported to CDK_GENESIS_PROD[_STAGING]_ALB_CERT_ARN (per env_name)."
+        required: true
+        type: string
+      wildcard_cert_arn:
+        description: "Optional extra SNI cert ARN (admin host). Exported to CDK_GENESIS_PROD[_STAGING]_WILDCARD_CERT_ARN (per env_name). Leave empty when alb_cert_arn already covers *.apex."
+        required: false
+        type: string
+        default: ""
+      instance_email_domain:
+        description: "Single-tenant email-domain lock (e.g. genesiscapital.com). Stamped on the Instance Domain Lock Action by auth0_setup."
+        required: false
+        type: string
+        default: ""
+      canary:
+        description: "Canary the agent-runtime roll."
+        required: false
+        type: boolean
+        default: true
+      rollback_on_failure:
+        required: false
+        type: boolean
+        default: true
+      notify:
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  JFROG_REGISTRY: ${{ vars.JFROG_REGISTRY || 'axiralabs.jfrog.io' }}
+
+jobs:
+  cdk:
+    name: CDK reconcile (bootstrap if fresh)
+    runs-on: ubuntu-latest
+    # Single approval gate for the whole deploy: first job to touch AWS, and every
+    # later job depends on it. Add required reviewers to the GitHub `genesis-prod`
+    # environment to require sign-off here (and only here).
+    environment: ${{ inputs.env_name }}
+    outputs:
+      fresh: ${{ steps.deploy.outputs.fresh }}
+    steps:
+      # Checks out the bundle's OWN code (default ref), NOT the RC image tag — the
+      # bundle has infra/ + scripts/ but no RC git tags. image_tag pulls images only.
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # Map the provider-agnostic caller inputs to the env-SPECIFIC CDK var NAMES
+      # that infra/lib/staging/config.ts reads for this env, and export them to
+      # $GITHUB_ENV so every later step in this job sees them. The var prefix is
+      # derived from env_name (genesis-prod => CDK_GENESIS_PROD_*, genesis-prod-staging
+      # => CDK_GENESIS_PROD_STAGING_*), so genesis-prod gets EXACTLY the same five
+      # CDK_GENESIS_PROD_* vars it always did — behavior preserved byte-for-byte.
+      - name: Resolve CDK_GENESIS_* env vars for ${{ inputs.env_name }}
+        env:
+          ENV_NAME: ${{ inputs.env_name }}
+          ACCOUNT: ${{ inputs.account }}
+          REGION: ${{ inputs.region }}
+          VPN_CIDRS: ${{ inputs.vpn_cidrs }}
+          ALB_CERT_ARN: ${{ inputs.alb_cert_arn }}
+          WILDCARD_CERT_ARN: ${{ inputs.wildcard_cert_arn }}
+        run: |
+          set -euo pipefail
+          PREFIX="CDK_$(echo "$ENV_NAME" | tr 'a-z-' 'A-Z_')"
+          {
+            echo "${PREFIX}_ACCOUNT=$ACCOUNT"
+            echo "${PREFIX}_REGION=$REGION"
+            echo "${PREFIX}_VPN_CIDRS=$VPN_CIDRS"
+            echo "${PREFIX}_ALB_CERT_ARN=$ALB_CERT_ARN"
+            echo "${PREFIX}_WILDCARD_CERT_ARN=$WILDCARD_CERT_ARN"
+          } >> "$GITHUB_ENV"
+          echo "exported ${PREFIX}_{ACCOUNT,REGION,VPN_CIDRS,ALB_CERT_ARN,WILDCARD_CERT_ARN}"
+      # STANDALONE install — infra's own (all-public) deps ONLY. No monorepo, no
+      # workspace, no @axira/* build. `npm ci` against the bundled standalone
+      # infra/package-lock.json. (--ignore-scripts: CDK/esbuild/tsx need no
+      # postinstall build for synth/deploy, and it avoids running any package
+      # lifecycle script during the deploy.)
+      - name: Install infra deps (standalone — no monorepo)
+        working-directory: infra
+        run: npm ci --ignore-scripts
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE }}
+          aws-region: ${{ inputs.region }}
+      - name: CDK bootstrap (placeholder if fresh; diff-only if existing)
+        id: deploy
+        working-directory: infra
+        env:
+          ENV_NAME: ${{ inputs.env_name }}
+          CLUSTER: ${{ inputs.cluster }}
+          REGION: ${{ inputs.region }}
+        run: |
+          set -euo pipefail
+          # Fresh = the gateway ECS service does not exist yet (brand-new env).
+          if aws ecs describe-services --cluster "$CLUSTER" --services "axira-$ENV_NAME-gateway" \
+               --region "$REGION" --query 'services[?status==`ACTIVE`]' --output text 2>/dev/null | grep -q ACTIVE; then
+            FRESH=false
+          else
+            FRESH=true
+          fi
+          echo "fresh=$FRESH" >> "$GITHUB_OUTPUT"
+          echo "fresh env: $FRESH"
+          if [ "$FRESH" = "true" ]; then
+            # Stand the topology up on the nginx placeholder so the ECR repos AND
+            # the db-migrate task def exist before any real image is mirrored. The
+            # real flip happens in cdk_finalize, AFTER migrate.
+            echo "::notice::fresh env — bootstrapping all infra on placeholder images (real images + flip applied in cdk_finalize, after migrate)"
+            npx cdk deploy -c env="$ENV_NAME" --all -c placeholderImage=true \
+              -c deployNonce="$GITHUB_RUN_ID" --require-approval never --concurrency 5
+          else
+            echo "::notice::existing env — diff only here; the real reconcile runs in cdk_finalize after migrate"
+            npx cdk diff -c env="$ENV_NAME" --all || true
+          fi
+
+  mirror:
+    name: Verify (Genesis key) + mirror (${{ matrix.service }})
+    needs: [cdk]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The customer-deployed service set. teams-bot is NOT shipped.
+        service:
+          [
+            gateway,
+            experience,
+            agent-runtime,
+            workflow-engine,
+            admin-hub,
+            observability-alert-runner,
+          ]
+    steps:
+      # cosign-installer@v3 with NO cosign-release pin — installs the installer's
+      # default cosign, matching the signer + the prod verify gate.
+      - uses: sigstore/cosign-installer@v3
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE }}
+          aws-region: ${{ inputs.region }}
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+      - name: cosign-verify (GENESIS public key) + mirror to ECR
+        env:
+          SVC: ${{ matrix.service }}
+          TAG: ${{ inputs.image_tag }}
+          ENV_NAME: ${{ inputs.env_name }}
+          ECR: ${{ steps.ecr.outputs.registry }}
+          SOURCE_REPO: ${{ inputs.source_repo }}
+          # Genesis's cosign PUBLIC key (Axira holds the matching private key).
+          COSIGN_INTERNAL_PUBLIC_KEY: ${{ secrets.COSIGN_INTERNAL_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          # ECR repo path: compute-stack.ts names every repo `axira/<env>/<svc.name>`.
+          # All svc.names carry the `axira-` prefix EXCEPT the alert-runner, whose
+          # serviceName is `observability-alert-runner` (no `axira-` prefix). The
+          # JFrog SOURCE name is `axira-$SVC` for all of them.
+          if [ "$SVC" = "observability-alert-runner" ]; then
+            repo="axira/$ENV_NAME/$SVC"
+          else
+            repo="axira/$ENV_NAME/axira-$SVC"
+          fi
+          if ! aws ecr describe-repositories --repository-names "$repo" >/dev/null 2>&1; then
+            echo "::notice::ECR repo $repo absent — $SVC not deployed in $ENV_NAME, skipping"; exit 0
+          fi
+          if [ -z "${COSIGN_INTERNAL_PUBLIC_KEY:-}" ]; then
+            echo "::error::COSIGN_INTERNAL_PUBLIC_KEY (Genesis public key) not set — refusing to mirror unverified images."
+            exit 1
+          fi
+          echo "${{ secrets.JFROG_TOKEN }}" | docker login "$JFROG_REGISTRY" -u "${{ secrets.JFROG_USER }}" --password-stdin
+          SRC="$JFROG_REGISTRY/$SOURCE_REPO/axira-$SVC:$TAG"
+          DST="$ECR/$repo:$TAG"
+          echo "mirror pull source: $SRC"
+          # Gate on the cosign signature BEFORE moving the artifact into ECR. Verify
+          # the TAG (signed index); --insecure-ignore-tlog=true (Axira-managed key,
+          # not keyless — no public transparency log by design).
+          cosign verify --key env://COSIGN_INTERNAL_PUBLIC_KEY \
+            --insecure-ignore-tlog=true "$SRC"
+          docker pull "$SRC"
+          docker tag "$SRC" "$DST"
+          docker push "$DST"
+          echo "verified (Genesis key) + mirrored $SRC -> $DST"
+          # Seed :latest ONCE (first deploy only — ECR is IMMUTABLE). The CDK task
+          # def references :latest, so the fresh-env real deploy needs it to exist.
+          if ! aws ecr describe-images --repository-name "$repo" --image-ids imageTag=latest >/dev/null 2>&1; then
+            docker tag "$SRC" "$ECR/$repo:latest"
+            docker push "$ECR/$repo:latest"
+            echo "seeded $ECR/$repo:latest (first deploy)"
+          fi
+
+  seed_secrets:
+    name: Seed provider secrets (when unpopulated)
+    needs: [cdk]
+    runs-on: ubuntu-latest
+    env:
+      ENV_NAME: ${{ inputs.env_name }}
+      REGION: ${{ inputs.region }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE }}
+          aws-region: ${{ inputs.region }}
+      - name: Populate auth0 / auth0-m2m / auth0-mgmt (+ anthropic if present) from the GitHub seed secret
+        # Auth0 values are supplied by Axira; Genesis stores them. genesis-prod uses
+        # the SHARED Axira PROD tenant via GENESIS_PROD_SECRETS_JSON; genesis-prod-staging
+        # uses Axira's DEV/STAGING tenant via GENESIS_STAGING_SECRETS_JSON — the tenant
+        # itself is NOT a code field, it is just whatever `.auth0.domain` the chosen
+        # seed carries. The right seed is selected by env_name below (genesis-prod
+        # still reads GENESIS_PROD_SECRETS_JSON exactly as before). DB creds are
+        # auto-generated by CDK. openfga is created + owned by the OpenFgaStack
+        # bootstrap custom resource (it re-merges the real storeId/modelId/apiUrl/apiToken
+        # on every deploy) — DELIBERATELY NOT seeded here, or the bootstrap's real
+        # values would be clobbered with a placeholder.
+        env:
+          GENESIS_PROD_SEED: ${{ secrets.GENESIS_PROD_SECRETS_JSON }}
+          GENESIS_STAGING_SEED: ${{ secrets.GENESIS_STAGING_SECRETS_JSON }}
+        run: |
+          set -euo pipefail
+          # Pick the seed for this env. Staging => GENESIS_STAGING_SECRETS_JSON;
+          # everything else (genesis-prod) => GENESIS_PROD_SECRETS_JSON.
+          if [ "$ENV_NAME" = "genesis-prod-staging" ]; then
+            SEED="$GENESIS_STAGING_SEED"
+            SEED_VAR="GENESIS_STAGING_SECRETS_JSON"
+          else
+            SEED="$GENESIS_PROD_SEED"
+            SEED_VAR="GENESIS_PROD_SECRETS_JSON"
+          fi
+          if [ -z "${SEED:-}" ]; then
+            echo "::error::no seed JSON for $ENV_NAME (set $SEED_VAR) — services can't boot without populated secrets"
+            exit 1
+          fi
+          for key in auth0 auth0-m2m auth0-mgmt; do
+            # Seed ONLY if still a placeholder (CDK creates shells with a random
+            # string; a real value is a JSON object). Idempotent + safe every deploy.
+            cur=$(aws secretsmanager get-secret-value --region "$REGION" \
+              --secret-id "axira/$ENV_NAME/$key" --query SecretString --output text 2>/dev/null || true)
+            if printf '%s' "$cur" | jq -e 'type == "object"' >/dev/null 2>&1; then
+              echo "axira/$ENV_NAME/$key already populated (JSON object) — skip"
+              continue
+            fi
+            val=$(printf '%s' "$SEED" | jq -ce --arg k "$key" '.[$k]')
+            aws secretsmanager put-secret-value --region "$REGION" \
+              --secret-id "axira/$ENV_NAME/$key" --secret-string "$val" >/dev/null
+            echo "seeded axira/$ENV_NAME/$key"
+          done
+          # anthropic only when the seed carries it (genesis-prod is Bedrock, so it
+          # normally won't — harmless to skip).
+          curanth=$(aws secretsmanager get-secret-value --region "$REGION" \
+            --secret-id "axira/$ENV_NAME/anthropic" --query SecretString --output text 2>/dev/null || true)
+          if printf '%s' "$SEED" | jq -e 'has("anthropic")' >/dev/null \
+             && ! printf '%s' "$curanth" | jq -e 'type == "object"' >/dev/null 2>&1; then
+            val=$(printf '%s' "$SEED" | jq -ce '.anthropic')
+            aws secretsmanager put-secret-value --region "$REGION" \
+              --secret-id "axira/$ENV_NAME/anthropic" --secret-string "$val" >/dev/null
+            echo "seeded axira/$ENV_NAME/anthropic"
+          else
+            echo "no anthropic key in seed for $ENV_NAME — leaving axira/$ENV_NAME/anthropic empty (bedrock env)"
+          fi
+          echo "provider secrets seeded (openfga NOT seeded here — the OpenFgaStack bootstrap owns it)"
+
+  migrate:
+    name: DB migrate (one-off ECS task — BEFORE the flip)
+    needs: [cdk, mirror, seed_secrets]
+    if: ${{ always() && needs.cdk.result == 'success' && needs.mirror.result == 'success' && (needs.seed_secrets.result == 'success' || needs.seed_secrets.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    env:
+      CLUSTER: ${{ inputs.cluster }}
+      ENV_NAME: ${{ inputs.env_name }}
+      REGION: ${{ inputs.region }}
+      TAG: ${{ inputs.image_tag }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE }}
+          aws-region: ${{ inputs.region }}
+      - name: Run db:migrate on the gateway image (CDK db-migrate task def)
+        # Runs the CDK-managed `axira-<env>-db-migrate` task definition (gateway
+        # image; DATABASE_* injected from the postgres-app secret; dedicated IAM
+        # roles with the secret read already granted). Migrations + scripts/migrate.mjs
+        # are BAKED INTO the gateway image — NO SQL ships in the bundle. We only pin
+        # the container image to this RC's :<tag> and feed it the gateway service's
+        # subnets+SG. NOT cloned from the gateway SERVICE (pre-flip = nginx placeholder).
+        run: |
+          set -euo pipefail
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          GW="axira-$ENV_NAME-gateway"
+          MIGRATE_FAMILY="axira-$ENV_NAME-db-migrate"
+          IMG="$ACCOUNT.dkr.ecr.$REGION.amazonaws.com/axira/$ENV_NAME/axira-gateway:$TAG"
+
+          netcfg=$(aws ecs describe-services --cluster "$CLUSTER" --services "$GW" \
+            --query 'services[0].networkConfiguration' --output json 2>/dev/null || echo "null")
+          if [ -z "$netcfg" ] || [ "$netcfg" = "null" ]; then
+            echo "::error::gateway service $GW not found — bootstrap (cdk job) did not stand up the gateway service; cannot resolve subnets/SG for the migrate task"
+            exit 1
+          fi
+
+          # Prefer the CDK db-migrate task def. Fall back to the gateway SERVICE task
+          # def only when the family does not exist yet (can happen once on an
+          # already-existing env the first time migrate-before-flip ships).
+          if aws ecs describe-task-definition --task-definition "$MIGRATE_FAMILY" \
+               --query 'taskDefinition.taskDefinitionArn' --output text >/dev/null 2>&1; then
+            echo "using CDK db-migrate task def family: $MIGRATE_FAMILY"
+            aws ecs describe-task-definition --task-definition "$MIGRATE_FAMILY" \
+              --query 'taskDefinition' > td.json
+          else
+            echo "::notice::$MIGRATE_FAMILY not registered yet — falling back to the gateway service task def"
+            td_arn=$(aws ecs describe-services --cluster "$CLUSTER" --services "$GW" \
+              --query 'services[0].taskDefinition' --output text 2>/dev/null || echo "")
+            if [ -z "$td_arn" ] || [ "$td_arn" = "None" ]; then
+              echo "::error::neither $MIGRATE_FAMILY nor the gateway service $GW task def is available — cannot run migrate"
+              exit 1
+            fi
+            aws ecs describe-task-definition --task-definition "$td_arn" \
+              --query 'taskDefinition' > td.json
+          fi
+
+          jq --arg img "$IMG" --arg fam "$MIGRATE_FAMILY" '
+            .family=$fam
+            | .containerDefinitions |= map(if (.image | test("axira-gateway")) then .image=$img else . end)
+            | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy,.deregisteredAt)
+          ' td.json > td_migrate.json
+          mtd=$(aws ecs register-task-definition --cli-input-json file://td_migrate.json \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "registered migrate task def: $mtd"
+
+          # Assemble DATABASE_URL from the injected parts (same formula as
+          # packages/db/src/connection-env.ts) and run the BAKED-IN migrator.
+          JS='const u=encodeURIComponent(process.env.DATABASE_USERNAME||""),p=encodeURIComponent(process.env.DATABASE_PASSWORD||""),h=process.env.DATABASE_HOST,pt=process.env.DATABASE_PORT||"5432",n=process.env.DATABASE_NAME||"axira";process.env.DATABASE_URL="postgresql://"+u+":"+p+"@"+h+":"+pt+"/"+n+"?sslmode=require";require("child_process").execFileSync("node",["scripts/migrate.mjs"],{stdio:"inherit",env:process.env});'
+          overrides=$(jq -nc --arg js "$JS" '{containerOverrides:[{name:"axira-gateway",command:["node","-e",$js]}]}')
+          task_arn=$(aws ecs run-task --cluster "$CLUSTER" --task-definition "$mtd" \
+            --launch-type FARGATE --network-configuration "$netcfg" \
+            --overrides "$overrides" --query 'tasks[0].taskArn' --output text)
+          if [ -z "$task_arn" ] || [ "$task_arn" = "None" ]; then
+            echo "::error::run-task did not return a task ARN — the migrate task failed to start (check subnets/SG/exec-role)"
+            exit 1
+          fi
+          echo "migration task: $task_arn"
+          aws ecs wait tasks-stopped --cluster "$CLUSTER" --tasks "$task_arn"
+          code=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$task_arn" \
+            --query "tasks[0].containers[?name=='axira-gateway'].exitCode | [0]" --output text)
+          echo "migration exit code: $code"
+          if [ "$code" != "0" ]; then
+            reason=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$task_arn" --query "tasks[0].stoppedReason" --output text || true)
+            echo "::error::db:migrate failed (exit $code; $reason) — refusing to flip services onto an unmigrated schema"
+            exit 1
+          fi
+          echo "migrations applied — safe to flip"
+
+  cdk_finalize:
+    name: CDK finalize (real task defs + flip — after migrate)
+    needs: [cdk, migrate]
+    if: ${{ always() && needs.cdk.result == 'success' && needs.migrate.result == 'success' }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.env_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # Same env-specific CDK var mapping as the `cdk` job (see its comment). For
+      # genesis-prod this exports the identical CDK_GENESIS_PROD_* set as before.
+      - name: Resolve CDK_GENESIS_* env vars for ${{ inputs.env_name }}
+        env:
+          ENV_NAME: ${{ inputs.env_name }}
+          ACCOUNT: ${{ inputs.account }}
+          REGION: ${{ inputs.region }}
+          VPN_CIDRS: ${{ inputs.vpn_cidrs }}
+          ALB_CERT_ARN: ${{ inputs.alb_cert_arn }}
+          WILDCARD_CERT_ARN: ${{ inputs.wildcard_cert_arn }}
+        run: |
+          set -euo pipefail
+          PREFIX="CDK_$(echo "$ENV_NAME" | tr 'a-z-' 'A-Z_')"
+          {
+            echo "${PREFIX}_ACCOUNT=$ACCOUNT"
+            echo "${PREFIX}_REGION=$REGION"
+            echo "${PREFIX}_VPN_CIDRS=$VPN_CIDRS"
+            echo "${PREFIX}_ALB_CERT_ARN=$ALB_CERT_ARN"
+            echo "${PREFIX}_WILDCARD_CERT_ARN=$WILDCARD_CERT_ARN"
+          } >> "$GITHUB_ENV"
+          echo "exported ${PREFIX}_{ACCOUNT,REGION,VPN_CIDRS,ALB_CERT_ARN,WILDCARD_CERT_ARN}"
+      - name: Install infra deps (standalone — no monorepo)
+        working-directory: infra
+        run: npm ci --ignore-scripts
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE }}
+          aws-region: ${{ inputs.region }}
+      - name: CDK deploy (real task definitions + flip)
+        working-directory: infra
+        run: |
+          set -euo pipefail
+          # deployNonce (== this run's id) re-runs the OpenFgaStack bootstrap custom
+          # resource so it re-merges the real storeId/modelId/apiUrl/apiToken into
+          # the openfga secret (lets a clobbered/empty secret self-heal). Idempotent.
+          npx cdk deploy -c env="${{ inputs.env_name }}" --all \
+            -c deployNonce="$GITHUB_RUN_ID" --require-approval never --concurrency 5
+
+  auth0_setup:
+    name: Auth0 tenant setup (idempotent, every deploy)
+    needs: [cdk, seed_secrets, cdk_finalize]
+    # Applies the web app's passwordless-OTP grant + RS256, the identity:resolve
+    # client-grant, the three post-login Actions + binding order, via
+    # scripts/setup-auth0-tenant.mjs (Node built-ins + global fetch only — no install).
+    # Gated on cdk_finalize so the deploy role's KMS-decrypt grant (SecretsStack) is
+    # live before this reads the CMK-encrypted secrets.
+    if: ${{ always() && needs.cdk.result == 'success' && needs.cdk_finalize.result == 'success' && (needs.seed_secrets.result == 'success' || needs.seed_secrets.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.env_name }}
+    env:
+      ENV_NAME: ${{ inputs.env_name }}
+      REGION: ${{ inputs.region }}
+      INSTANCE_EMAIL_DOMAIN: ${{ inputs.instance_email_domain }}
+    steps:
+      # Checks out the bundle's OWN code (default ref) — it ships scripts/setup-auth0-tenant.mjs.
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE }}
+          aws-region: ${{ inputs.region }}
+      - name: Apply Auth0 tenant config (passwordless-OTP grant, 3 post-login Actions + order, RS256)
+        run: |
+          set -euo pipefail
+          auth0=$(aws secretsmanager get-secret-value --region "$REGION" \
+            --secret-id "axira/$ENV_NAME/auth0" --query SecretString --output text)
+          mgmt=$(aws secretsmanager get-secret-value --region "$REGION" \
+            --secret-id "axira/$ENV_NAME/auth0-mgmt" --query SecretString --output text)
+          m2m=$(aws secretsmanager get-secret-value --region "$REGION" \
+            --secret-id "axira/$ENV_NAME/auth0-m2m" --query SecretString --output text 2>/dev/null || echo '{}')
+
+          AUTH0_DOMAIN=$(printf '%s' "$auth0" | jq -r '.domain // empty')
+          AUTH0_WEB_APP_CLIENT_ID=$(printf '%s' "$auth0" | jq -r '.clientId // empty')
+          AUTH0_MGMT_CLIENT_ID=$(printf '%s' "$mgmt" | jq -r '.clientId // empty')
+          AUTH0_MGMT_CLIENT_SECRET=$(printf '%s' "$mgmt" | jq -r '.clientSecret // empty')
+          AUTH0_M2M_CLIENT_ID=$(printf '%s' "$m2m" | jq -r '.clientId // empty')
+
+          miss=""
+          [ -z "$AUTH0_DOMAIN" ] && miss="$miss auth0.domain"
+          [ -z "$AUTH0_WEB_APP_CLIENT_ID" ] && miss="$miss auth0.clientId"
+          [ -z "$AUTH0_MGMT_CLIENT_ID" ] && miss="$miss auth0-mgmt.clientId"
+          [ -z "$AUTH0_MGMT_CLIENT_SECRET" ] && miss="$miss auth0-mgmt.clientSecret"
+          if [ -n "$miss" ]; then
+            echo "::error::Auth0 setup can't run — missing secret fields:$miss. Seed axira/$ENV_NAME/auth0 + axira/$ENV_NAME/auth0-mgmt before deploy, or login will be broken."
+            exit 1
+          fi
+          if [ -z "$AUTH0_M2M_CLIENT_ID" ]; then
+            echo "::warning::auth0-m2m.clientId not populated for $ENV_NAME — the identity:resolve client-grant will be SKIPPED."
+          fi
+
+          export AUTH0_DOMAIN AUTH0_WEB_APP_CLIENT_ID AUTH0_MGMT_CLIENT_ID AUTH0_MGMT_CLIENT_SECRET AUTH0_M2M_CLIENT_ID
+          echo "applying Auth0 tenant config for $AUTH0_DOMAIN (web app $AUTH0_WEB_APP_CLIENT_ID; m2m ${AUTH0_M2M_CLIENT_ID:-<unset>}; domain-lock=${INSTANCE_EMAIL_DOMAIN:-<inert>})"
+          node scripts/setup-auth0-tenant.mjs
+
+  roll:
+    name: Roll Fargate services
+    needs: [cdk_finalize]
+    if: ${{ always() && needs.cdk_finalize.result == 'success' }}
+    runs-on: ubuntu-latest
+    outputs:
+      prev: ${{ steps.roll.outputs.prev }}
+    env:
+      CLUSTER: ${{ inputs.cluster }}
+      ENV_NAME: ${{ inputs.env_name }}
+      REGION: ${{ inputs.region }}
+      TAG: ${{ inputs.image_tag }}
+      CANARY: ${{ inputs.canary }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE }}
+          aws-region: ${{ inputs.region }}
+      - name: Pin services to :<image_tag>
+        id: roll
+        run: |
+          set -euo pipefail
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          ECR="$ACCOUNT.dkr.ecr.$REGION.amazonaws.com"
+          rolled=""; prev_map='{}'
+          trap 'echo "prev=$prev_map" >> "$GITHUB_OUTPUT"' EXIT
+
+          deploy_one() {
+            short="$1"; service="$2"; canary="$3"
+            repo="axira/$ENV_NAME/axira-$short"
+            if ! aws ecs describe-services --cluster "$CLUSTER" --services "$service" \
+                  --query 'services[?status==`ACTIVE`]' --output text | grep -q ACTIVE; then
+              echo "::notice::$service not ACTIVE — skipping"; return 0
+            fi
+            if ! aws ecr describe-images --repository-name "$repo" --image-ids imageTag="$TAG" >/dev/null 2>&1; then
+              echo "::warning::no $repo:$TAG in ECR — skipping $service"; return 0
+            fi
+            cur=$(aws ecs describe-services --cluster "$CLUSTER" --services "$service" \
+              --query 'services[0].taskDefinition' --output text)
+            prev_map=$(echo "$prev_map" | jq -c --arg s "$service" --arg t "$cur" '. + {($s): $t}')
+            aws ecs describe-task-definition --task-definition "$cur" --query 'taskDefinition' > td.json
+            jq --arg img "$ECR/$repo:$TAG" --arg m "axira-$short" '
+              .containerDefinitions |= map(if (.image | contains($m)) then .image=$img else . end)
+              | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy,.deregisteredAt)
+            ' td.json > td_new.json
+            new_arn=$(aws ecs register-task-definition --cli-input-json file://td_new.json \
+              --query 'taskDefinition.taskDefinitionArn' --output text)
+            if [ "$canary" = "true" ]; then
+              aws ecs update-service --cluster "$CLUSTER" --service "$service" --task-definition "$new_arn" \
+                --deployment-configuration "maximumPercent=150,minimumHealthyPercent=100" >/dev/null
+            else
+              aws ecs update-service --cluster "$CLUSTER" --service "$service" --task-definition "$new_arn" >/dev/null
+            fi
+            echo "rolled $service -> ${new_arn##*/}"
+            rolled="$rolled $service"
+          }
+
+          # Bespoke roll for the alert-runner (repo `axira/<env>/observability-alert-runner`,
+          # service `axira-<env>-alert-runner`, image segment `observability-alert-runner`).
+          deploy_one_explicit() {
+            service="$1"; repo="$2"; match="$3"
+            if ! aws ecs describe-services --cluster "$CLUSTER" --services "$service" \
+                  --query 'services[?status==`ACTIVE`]' --output text | grep -q ACTIVE; then
+              echo "::notice::$service not ACTIVE — skipping"; return 0
+            fi
+            if ! aws ecr describe-images --repository-name "$repo" --image-ids imageTag="$TAG" >/dev/null 2>&1; then
+              echo "::warning::no $repo:$TAG in ECR — skipping $service"; return 0
+            fi
+            cur=$(aws ecs describe-services --cluster "$CLUSTER" --services "$service" \
+              --query 'services[0].taskDefinition' --output text)
+            prev_map=$(echo "$prev_map" | jq -c --arg s "$service" --arg t "$cur" '. + {($s): $t}')
+            aws ecs describe-task-definition --task-definition "$cur" --query 'taskDefinition' > td.json
+            jq --arg img "$ECR/$repo:$TAG" --arg m "$match" '
+              .containerDefinitions |= map(if (.image | contains($m)) then .image=$img else . end)
+              | del(.taskDefinitionArn,.revision,.status,.requiresAttributes,.compatibilities,.registeredAt,.registeredBy,.deregisteredAt)
+            ' td.json > td_new.json
+            new_arn=$(aws ecs register-task-definition --cli-input-json file://td_new.json \
+              --query 'taskDefinition.taskDefinitionArn' --output text)
+            aws ecs update-service --cluster "$CLUSTER" --service "$service" --task-definition "$new_arn" >/dev/null
+            echo "rolled $service -> ${new_arn##*/}"
+            rolled="$rolled $service"
+          }
+
+          for short in gateway experience agent-runtime workflow-engine admin-hub; do
+            canary=false
+            if [ "$short" = "agent-runtime" ] && [ "$CANARY" = "true" ]; then canary=true; fi
+            deploy_one "$short" "axira-$ENV_NAME-$short" "$canary"
+          done
+          deploy_one_explicit "axira-$ENV_NAME-alert-runner" \
+            "axira/$ENV_NAME/observability-alert-runner" "observability-alert-runner"
+
+          if [ -n "$rolled" ]; then
+            # shellcheck disable=SC2086
+            aws ecs wait services-stable --cluster "$CLUSTER" --services $rolled
+            echo "stable:$rolled"
+          else
+            echo "::warning::no services rolled"
+          fi
+
+  smoke:
+    name: Smoke test (VPC-internal)
+    needs: [roll]
+    if: ${{ always() && needs.roll.result == 'success' }}
+    runs-on: ubuntu-latest
+    env:
+      CLUSTER: ${{ inputs.cluster }}
+      ENV_NAME: ${{ inputs.env_name }}
+      REGION: ${{ inputs.region }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE }}
+          aws-region: ${{ inputs.region }}
+      - name: Probe internal health endpoints from inside the VPC
+        run: |
+          set -euo pipefail
+          # The internal ALB is unreachable from the GitHub runner (vpn-private), so
+          # probe the Cloud Map internal endpoints from a one-off task in the VPC on
+          # the (already rolled) gateway image. Hits the gateway DEEP readiness probe.
+          GW="axira-$ENV_NAME-gateway"
+          td_arn=$(aws ecs describe-services --cluster "$CLUSTER" --services "$GW" \
+            --query 'services[0].taskDefinition' --output text)
+          netcfg=$(aws ecs describe-services --cluster "$CLUSTER" --services "$GW" \
+            --query 'services[0].networkConfiguration' --output json)
+          JS='const http=require("http");const eps=[["gateway.axira.internal",3001,"/health/ready"],["experience.axira.internal",3000,"/api/health"]];const ATTEMPTS=3,BACKOFF=10000;const probe=()=>new Promise((res)=>{let n=eps.length,bad=0;const done=()=>{if(--n===0)res(bad)};eps.forEach(([h,p,path])=>{const req=http.get({host:h,port:p,path,timeout:8000},(r)=>{console.log(h+path+" -> "+r.statusCode);if(r.statusCode>=400)bad++;done()});req.on("error",(e)=>{console.log(h+path+" ERR "+e.message);bad++;done()});req.on("timeout",()=>{req.destroy();console.log(h+path+" TIMEOUT");bad++;done()})})});const sleep=(ms)=>new Promise((r)=>setTimeout(r,ms));(async()=>{let bad=0;for(let i=1;i<=ATTEMPTS;i++){console.log("smoke attempt "+i+"/"+ATTEMPTS);bad=await probe();if(bad===0){process.exit(0)}if(i<ATTEMPTS){console.log("  "+bad+" endpoint(s) bad — retrying in "+(BACKOFF/1000)+"s");await sleep(BACKOFF)}}console.log("smoke still failing after "+ATTEMPTS+" attempts ("+bad+" bad)");process.exit(1)})();'
+          overrides=$(jq -nc --arg js "$JS" '{containerOverrides:[{name:"axira-gateway",command:["node","-e",$js]}]}')
+          task_arn=$(aws ecs run-task --cluster "$CLUSTER" --task-definition "$td_arn" \
+            --launch-type FARGATE --network-configuration "$netcfg" \
+            --overrides "$overrides" --query 'tasks[0].taskArn' --output text)
+          echo "smoke task: $task_arn"
+          aws ecs wait tasks-stopped --cluster "$CLUSTER" --tasks "$task_arn"
+          code=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$task_arn" \
+            --query "tasks[0].containers[?name=='axira-gateway'].exitCode | [0]" --output text)
+          echo "internal smoke exit code: $code"
+          [ "$code" = "0" ] || { echo "::error::internal smoke failed (exit $code)"; exit 1; }
+          echo "smoke ok (internal)"
+
+  rollback:
+    name: Rollback on failure
+    needs: [roll, smoke]
+    if: ${{ always() && inputs.rollback_on_failure && (needs.roll.result == 'failure' || needs.smoke.result == 'failure') }}
+    runs-on: ubuntu-latest
+    env:
+      CLUSTER: ${{ inputs.cluster }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE }}
+          aws-region: ${{ inputs.region }}
+      - name: Revert services to previous task definitions
+        env:
+          PREV: ${{ needs.roll.outputs.prev }}
+        run: |
+          set -euo pipefail
+          echo "${PREV:-'{}'}" > prev.json
+          if [ "$(jq 'length' prev.json)" = "0" ]; then echo "nothing to roll back"; exit 0; fi
+          rolled=""
+          for service in $(jq -r 'keys[]' prev.json); do
+            arn=$(jq -r --arg s "$service" '.[$s]' prev.json)
+            echo "reverting $service -> ${arn##*/}"
+            aws ecs update-service --cluster "$CLUSTER" --service "$service" --task-definition "$arn" >/dev/null
+            rolled="$rolled $service"
+          done
+          if [ -n "$rolled" ]; then
+            # shellcheck disable=SC2086
+            aws ecs wait services-stable --cluster "$CLUSTER" --services $rolled
+          fi
+          # Reverts the image/task-def only. Migrations are forward-only.
+          echo "::error::deploy failed — services rolled back to their previous task definitions"
+
+  notify:
+    name: Notify
+    needs:
+      [
+        cdk,
+        mirror,
+        seed_secrets,
+        migrate,
+        cdk_finalize,
+        auth0_setup,
+        roll,
+        smoke,
+        rollback,
+      ]
+    if: ${{ always() && inputs.notify }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Slack
+        env:
+          CDK: ${{ needs.cdk.result }}
+          MIRROR: ${{ needs.mirror.result }}
+          SEED: ${{ needs.seed_secrets.result }}
+          MIGRATE: ${{ needs.migrate.result }}
+          FINALIZE: ${{ needs.cdk_finalize.result }}
+          AUTH0: ${{ needs.auth0_setup.result }}
+          ROLL: ${{ needs.roll.result }}
+          SMOKE: ${{ needs.smoke.result }}
+          DEPLOY_HOOK: ${{ secrets.SLACK_DEPLOYMENTS_WEBHOOK }}
+          INC_HOOK: ${{ secrets.SLACK_INCIDENTS_WEBHOOK }}
+          ENV_NAME: ${{ inputs.env_name }}
+          TAG: ${{ inputs.image_tag }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          failed=""
+          for kv in "cdk:$CDK" "mirror:$MIRROR" "seed_secrets:$SEED" "migrate:$MIGRATE" \
+                    "cdk_finalize:$FINALIZE" "auth0_setup:$AUTH0" "roll:$ROLL" "smoke:$SMOKE"; do
+            name="${kv%%:*}"; res="${kv#*:}"
+            if [ "$res" = "failure" ] || [ "$res" = "cancelled" ]; then
+              failed="$failed $name=$res"
+            fi
+          done
+          if [ -z "$failed" ]; then
+            hook="${DEPLOY_HOOK:-}"; text="✅ $ENV_NAME deploy succeeded @ $TAG"
+          else
+            hook="${INC_HOOK:-}"; text="🚨 $ENV_NAME deploy FAILED @ $TAG —$failed — $RUN_URL"
+          fi
+          if [ -z "$hook" ]; then echo "::notice::no Slack webhook configured — skipping"; exit 0; fi
+          curl -fsS -X POST "$hook" -H 'Content-Type: application/json' -d "$(jq -nc --arg t "$text" '{text:$t}')"

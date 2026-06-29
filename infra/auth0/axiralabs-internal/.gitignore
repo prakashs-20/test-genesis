@@ -1,0 +1,4 @@
+# Local-only YAML overrides used during development
+*.local.yaml
+# Auth0 deploy-cli backups
+*.backup

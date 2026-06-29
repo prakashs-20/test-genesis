@@ -1,0 +1,56 @@
+{
+  "index_patterns": ["axira-logs-*"],
+  "priority": 100,
+  "template": {
+    "settings": {
+      "index.codec": "best_compression",
+      "index.refresh_interval": "10s",
+      "index.translog.durability": "async",
+      "index.number_of_shards": 1,
+      "index.number_of_replicas": 1,
+      "index.mapping.total_fields.limit": 2000,
+      "plugins.index_state_management.policy_id": "axira-logs-15d"
+    },
+    "mappings": {
+      "dynamic_templates": [
+        {
+          "axira_ids_as_keyword": {
+            "match_mapping_type": "string",
+            "match_pattern": "regex",
+            "match": "^(tenantId|userId|agentId|caseId|phaseId|missionId|parentMissionId|workflowRunId|stepId|subWorkflowId|capabilityId|capabilityInvocationId|agentTaskId|toolCallId|llmCallId|decisionEvalId|ruleEvalId|workCardId|correlationId|spinePath|traceId|spanId)$",
+            "mapping": {
+              "type": "keyword",
+              "ignore_above": 1024
+            }
+          }
+        }
+      ],
+      "properties": {
+        "timestamp": { "type": "date" },
+        "level": { "type": "keyword" },
+        "service": { "type": "keyword" },
+        "message": {
+          "type": "text",
+          "fields": {
+            "raw": {
+              "type": "keyword",
+              "ignore_above": 8192
+            }
+          }
+        },
+        "spineDepth": { "type": "integer" },
+        "spineRef": {
+          "properties": {
+            "kind": { "type": "keyword" },
+            "id": { "type": "keyword" }
+          }
+        }
+      }
+    }
+  },
+  "_meta": {
+    "owner": "axira-observability",
+    "schema_version": "1.0",
+    "session": "2.1"
+  }
+}

@@ -1,0 +1,146 @@
+# ─────────────────────────────────────────────────────────────────────
+# ADOT Collector pipeline - DEPLOYED profile (Session 2.2).
+#
+# Fan-out shape:
+#   logs        : OTLP receivers ─▶ redact/enrich/batch ─▶ OpenSearch axira-logs-*
+#   traces      : OTLP receivers ─▶ redact/enrich/batch ─▶ OpenSearch axira-traces-*
+#   traces/llm  : OTLP receivers ─▶ filter axira.llm_call* ─▶ Phoenix (otlphttp)
+#
+# Variable substitution syntax: ${env:NAME} - values come from the
+# ECS container env populated by OtelCollectorConstruct (see
+# infra/lib/observability/otel-collector-construct.ts). The deployed
+# profile uses SigV4 against the OpenSearch domain at
+# https://${LOGS_OPENSEARCH_ENDPOINT}; the local-dev parallel is
+# infra/lib/observability/otel-collector-config.local.yaml.
+#
+# Index name mapping is anchored to the axira-logs-* / axira-traces-*
+# templates installed by ObservabilityStack at
+# infra/lib/observability/index-templates/logs-template.json:2 and
+# infra/lib/observability/index-templates/traces-template.json:2.
+# The exporter writes the tenant-scoped child index that those
+# templates govern via their `axira-logs-*` / `axira-traces-*`
+# patterns.
+# ─────────────────────────────────────────────────────────────────────
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  sigv4auth:
+    region: ${env:AWS_REGION}
+    service: es
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+    send_batch_max_size: 1024
+
+  resource:
+    attributes:
+      - key: service.namespace
+        value: axira
+        action: upsert
+      - key: deployment.environment
+        value: ${env:DEPLOYMENT_ENVIRONMENT}
+        action: upsert
+      - key: cluster.name
+        value: ${env:CLUSTER_NAME}
+        action: upsert
+
+  # Defense-in-depth PII redaction. The @axira/observability logger
+  # already redacts at source (packages/observability/src/logging/
+  # redaction.ts); these deletions catch anything that slipped past.
+  attributes/redact:
+    actions:
+      - key: http.request.body
+        action: delete
+      - key: http.response.body
+        action: delete
+      - key: db.statement
+        action: delete
+
+  # Fallback tenant tag so the OpenSearch index template still matches
+  # axira-logs-* when a record arrives without axira.tenant_id (early
+  # bootstrap paths, infrastructure background tasks, etc.).
+  attributes/tenant_default:
+    actions:
+      - key: axira.tenant_id
+        action: insert
+        value: unknown
+
+  # LLM-span filter: drop every span whose name does NOT begin with
+  # axira.llm_call (from withEntity({ kind: "llm_call", ... }) in
+  # packages/observability/src/tracing/span-helpers.ts). Only the
+  # surviving subset is exported on the traces/llm pipeline to
+  # Phoenix; the main traces pipeline keeps all spans.
+  filter/llm_spans:
+    error_mode: ignore
+    traces:
+      span:
+        - 'not IsMatch(name, "^axira\\.llm_call(:|$)")'
+
+exporters:
+  opensearch/logs:
+    http:
+      endpoint: ${env:LOGS_OPENSEARCH_ENDPOINT}
+      auth:
+        authenticator: sigv4auth
+      tls:
+        insecure_skip_verify: false
+    logs_index: axira-logs-%{axira.tenant_id}-%{+yyyy.MM.dd}
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+
+  opensearch/traces:
+    http:
+      endpoint: ${env:LOGS_OPENSEARCH_ENDPOINT}
+      auth:
+        authenticator: sigv4auth
+      tls:
+        insecure_skip_verify: false
+    traces_index: axira-traces-%{axira.tenant_id}-%{+yyyy.MM.dd}
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 300s
+
+  otlphttp/phoenix:
+    endpoint: ${env:PHOENIX_ENDPOINT}
+    tls:
+      insecure: ${env:PHOENIX_TLS_INSECURE}
+
+service:
+  extensions: [health_check, sigv4auth]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors:
+        [attributes/redact, attributes/tenant_default, resource, batch]
+      exporters: [opensearch/logs]
+    traces:
+      receivers: [otlp]
+      processors:
+        [attributes/redact, attributes/tenant_default, resource, batch]
+      exporters: [opensearch/traces]
+    traces/llm:
+      receivers: [otlp]
+      processors: [filter/llm_spans, batch]
+      exporters: [otlphttp/phoenix]
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      level: detailed
+      address: 0.0.0.0:8888

@@ -1,0 +1,72 @@
+{
+  "index_patterns": ["axira-traces-*"],
+  "priority": 100,
+  "template": {
+    "settings": {
+      "index.codec": "best_compression",
+      "index.refresh_interval": "10s",
+      "index.translog.durability": "async",
+      "index.number_of_shards": 1,
+      "index.number_of_replicas": 1,
+      "index.mapping.total_fields.limit": 2000,
+      "plugins.index_state_management.policy_id": "axira-traces-14d"
+    },
+    "mappings": {
+      "dynamic_templates": [
+        {
+          "axira_ids_as_keyword": {
+            "match_mapping_type": "string",
+            "match_pattern": "regex",
+            "match": "^(tenantId|userId|agentId|caseId|phaseId|missionId|parentMissionId|workflowRunId|stepId|subWorkflowId|capabilityId|capabilityInvocationId|agentTaskId|toolCallId|llmCallId|decisionEvalId|ruleEvalId|workCardId|correlationId|spinePath|traceId|spanId|parentSpanId)$",
+            "mapping": {
+              "type": "keyword",
+              "ignore_above": 1024
+            }
+          }
+        }
+      ],
+      "properties": {
+        "timestamp": { "type": "date" },
+        "traceId": { "type": "keyword" },
+        "spanId": { "type": "keyword" },
+        "parentSpanId": { "type": "keyword" },
+        "name": { "type": "keyword" },
+        "kind": { "type": "keyword" },
+        "service": { "type": "keyword" },
+        "startTimeNanos": { "type": "long" },
+        "endTimeNanos": { "type": "long" },
+        "durationNanos": { "type": "long" },
+        "statusCode": { "type": "keyword" },
+        "statusMessage": { "type": "text" },
+        "attributes": { "type": "object", "dynamic": true },
+        "events": {
+          "type": "nested",
+          "properties": {
+            "timestamp": { "type": "date" },
+            "name": { "type": "keyword" },
+            "attributes": { "type": "object", "dynamic": true }
+          }
+        },
+        "links": {
+          "type": "nested",
+          "properties": {
+            "traceId": { "type": "keyword" },
+            "spanId": { "type": "keyword" }
+          }
+        },
+        "spineDepth": { "type": "integer" },
+        "spineRef": {
+          "properties": {
+            "kind": { "type": "keyword" },
+            "id": { "type": "keyword" }
+          }
+        }
+      }
+    }
+  },
+  "_meta": {
+    "owner": "axira-observability",
+    "schema_version": "1.0",
+    "session": "2.1"
+  }
+}

@@ -1,0 +1,128 @@
+# ─────────────────────────────────────────────────────────────────────
+# ADOT Collector pipeline - LOCAL profile (Session 2.2).
+#
+# Mirrors otel-collector-config.yaml in shape but:
+#   - No sigv4auth extension (local OpenSearch has no AWS auth)
+#   - Plain HTTP endpoint, tls.insecure_skip_verify: true
+#   - PHOENIX_TLS_INSECURE: true for a dev-host Phoenix
+#
+# Mounted at /etc/otel/config.yaml in docker-compose.observability.yml.
+# ─────────────────────────────────────────────────────────────────────
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+    send_batch_max_size: 1024
+
+  resource:
+    attributes:
+      - key: service.namespace
+        value: axira
+        action: upsert
+      - key: deployment.environment
+        value: ${env:DEPLOYMENT_ENVIRONMENT}
+        action: upsert
+      - key: cluster.name
+        value: ${env:CLUSTER_NAME}
+        action: upsert
+
+  attributes/redact:
+    actions:
+      - key: http.request.body
+        action: delete
+      - key: http.response.body
+        action: delete
+      - key: db.statement
+        action: delete
+
+  attributes/tenant_default:
+    actions:
+      - key: axira.tenant_id
+        action: insert
+        value: unknown
+
+  filter/llm_spans:
+    error_mode: ignore
+    traces:
+      span:
+        - 'not IsMatch(name, "^axira\\.llm_call(:|$)")'
+
+exporters:
+  opensearch/logs:
+    http:
+      endpoint: ${env:LOGS_OPENSEARCH_ENDPOINT}
+      tls:
+        insecure_skip_verify: true
+    # The contrib opensearch exporter (0.118.0) does NOT expand %{...}
+    # template placeholders in `logs_index` — it forwards the literal
+    # string and OpenSearch rejects it ("must be lowercase" on the
+    # uppercase `MM` in the date placeholder). For local dev we use a
+    # single static index that matches the gateway's query-side
+    # `axira-logs-*` glob. Tenant scoping is enforced at query time
+    # via the gateway's `term: {tenantId: ...}` clause, so a single
+    # index is safe. Production uses sigv4 + data streams; do not
+    # copy this pattern there.
+    logs_index: axira-logs-local
+    retry_on_failure:
+      enabled: true
+      initial_interval: 2s
+      max_interval: 10s
+      max_elapsed_time: 60s
+
+  opensearch/traces:
+    # NOTE: contrib opensearch exporter (0.118.0) does NOT accept
+    # `traces_index` - only logs uses `logs_index`. Traces use
+    # `dataset` + `namespace` to compose the data-stream index name.
+    http:
+      endpoint: ${env:LOGS_OPENSEARCH_ENDPOINT}
+      tls:
+        insecure_skip_verify: true
+    dataset: axira-traces
+    namespace: local
+    retry_on_failure:
+      enabled: true
+      initial_interval: 2s
+      max_interval: 10s
+      max_elapsed_time: 60s
+
+  otlphttp/phoenix:
+    endpoint: ${env:PHOENIX_ENDPOINT}
+    tls:
+      insecure: ${env:PHOENIX_TLS_INSECURE}
+
+service:
+  extensions: [health_check]
+  pipelines:
+    logs:
+      receivers: [otlp]
+      processors:
+        [attributes/redact, attributes/tenant_default, resource, batch]
+      exporters: [opensearch/logs]
+    traces:
+      receivers: [otlp]
+      processors:
+        [attributes/redact, attributes/tenant_default, resource, batch]
+      exporters: [opensearch/traces]
+    traces/llm:
+      receivers: [otlp]
+      processors: [filter/llm_spans, batch]
+      exporters: [otlphttp/phoenix]
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      level: detailed
+      address: 0.0.0.0:8888

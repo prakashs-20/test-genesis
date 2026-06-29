@@ -1,0 +1,27 @@
+{
+  "name": "@axira/infra",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "synth": "cdk synth",
+    "synth:axira-los-staging": "cdk synth -c env=axira-los-staging",
+    "synth:axira-los": "cdk synth -c env=axira-los",
+    "synth:genesis-staging": "cdk synth -c env=genesis-staging",
+    "synth:genesis-prod": "cdk synth -c env=genesis-prod",
+    "diff": "cdk diff",
+    "deploy": "cdk deploy",
+    "destroy": "cdk destroy"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.170.0",
+    "constructs": "^10.4.0"
+  },
+  "devDependencies": {
+    "aws-cdk": "^2.170.0",
+    "esbuild": "^0.18.20",
+    "tsx": "^4.21.0",
+    "typescript": "^5.9.0"
+  }
+}
