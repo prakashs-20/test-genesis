@@ -154,15 +154,33 @@ jobs:
           VPN_CIDRS: ${{ inputs.vpn_cidrs }}
           ALB_CERT_ARN: ${{ inputs.alb_cert_arn }}
           WILDCARD_CERT_ARN: ${{ inputs.wildcard_cert_arn }}
+          DEPLOY_ROLE_ARN: ${{ secrets.AWS_DEPLOY_ROLE }}
         run: |
           set -euo pipefail
           PREFIX="CDK_$(echo "$ENV_NAME" | tr 'a-z-' 'A-Z_')"
+          # Guard: the cert inputs must be a single-line ACM cert ARN (or empty for
+          # the optional WILDCARD). The most common mis-config is pasting the Auth0
+          # JSON into a *_CERT_ARN var; a multi-line value then fails the $GITHUB_ENV
+          # write with a cryptic "Invalid format" error, so catch it with a clear one.
+          for name in ALB_CERT_ARN WILDCARD_CERT_ARN; do
+            val="${!name}"
+            [ -z "$val" ] && continue
+            if [ "$(printf '%s' "$val" | wc -l | tr -d ' ')" != "0" ]; then
+              echo "::error::${name} is multi-line. It must be a single ACM certificate ARN (arn:...:acm:...), not JSON. If you pasted the Auth0 config here, move it to GENESIS_PROD_SECRETS_JSON / GENESIS_STAGING_SECRETS_JSON and set ${name} to a cert ARN or leave it empty."
+              exit 1
+            fi
+            case "$val" in
+              arn:*:acm:*) : ;;
+              *) echo "::error::${name}='${val}' is not an ACM certificate ARN (expected arn:...:acm:...). Set a cert ARN, or leave it empty if unused."; exit 1 ;;
+            esac
+          done
           {
             echo "${PREFIX}_ACCOUNT=$ACCOUNT"
             echo "${PREFIX}_REGION=$REGION"
             echo "${PREFIX}_VPN_CIDRS=$VPN_CIDRS"
             echo "${PREFIX}_ALB_CERT_ARN=$ALB_CERT_ARN"
             echo "${PREFIX}_WILDCARD_CERT_ARN=$WILDCARD_CERT_ARN"
+            echo "CDK_DEPLOY_ROLE_ARN=$DEPLOY_ROLE_ARN"
           } >> "$GITHUB_ENV"
           echo "exported ${PREFIX}_{ACCOUNT,REGION,VPN_CIDRS,ALB_CERT_ARN,WILDCARD_CERT_ARN}"
       # STANDALONE install — infra's own (all-public) deps ONLY. No monorepo, no
@@ -286,6 +304,8 @@ jobs:
     name: Seed provider secrets (when unpopulated)
     needs: [cdk]
     runs-on: ubuntu-latest
+    outputs:
+      ops_hmac_arn: ${{ steps.seed.outputs.ops_hmac_arn }}
     env:
       ENV_NAME: ${{ inputs.env_name }}
       REGION: ${{ inputs.region }}
@@ -295,6 +315,7 @@ jobs:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE }}
           aws-region: ${{ inputs.region }}
       - name: Populate auth0 / auth0-m2m / auth0-mgmt (+ anthropic if present) from the GitHub seed secret
+        id: seed
         # Auth0 values are supplied by Axira; Genesis stores them. genesis-prod uses
         # the SHARED Axira PROD tenant via GENESIS_PROD_SECRETS_JSON; genesis-prod-staging
         # uses Axira's DEV/STAGING tenant via GENESIS_STAGING_SECRETS_JSON — the tenant
@@ -351,6 +372,29 @@ jobs:
             echo "no anthropic key in seed for $ENV_NAME — leaving axira/$ENV_NAME/anthropic empty (bedrock env)"
           fi
           echo "provider secrets seeded (openfga NOT seeded here — the OpenFgaStack bootstrap owns it)"
+
+          # ops-plane HMAC: Axira-supplied via the seed's "ops-hmac" key. Create-or-update
+          # a STANDALONE secret (not a CDK shell) and hand its ARN to cdk_finalize, which
+          # passes it to config.ts so the workflow-engine opsEmitter lights up. No ops-hmac
+          # key in the seed => skip; the env ships dark (no AXIRA_OPS_* on the wfe).
+          if printf '%s' "$SEED" | jq -e 'has("ops-hmac")' >/dev/null 2>&1; then
+            if printf '%s' "$SEED" | jq -e '."ops-hmac" | type == "string"' >/dev/null 2>&1; then
+              opsval=$(printf '%s' "$SEED" | jq -r '."ops-hmac"')
+            else
+              opsval=$(printf '%s' "$SEED" | jq -ce '."ops-hmac"')
+            fi
+            opssid="axira/$ENV_NAME/ops-plane-hmac"
+            if aws secretsmanager describe-secret --region "$REGION" --secret-id "$opssid" >/dev/null 2>&1; then
+              aws secretsmanager put-secret-value --region "$REGION" --secret-id "$opssid" --secret-string "$opsval" >/dev/null
+              opsarn=$(aws secretsmanager describe-secret --region "$REGION" --secret-id "$opssid" --query ARN --output text)
+            else
+              opsarn=$(aws secretsmanager create-secret --region "$REGION" --name "$opssid" --secret-string "$opsval" --query ARN --output text)
+            fi
+            echo "ops_hmac_arn=$opsarn" >> "$GITHUB_OUTPUT"
+            echo "seeded ops-plane HMAC -> $opssid"
+          else
+            echo "no ops-hmac key in seed for $ENV_NAME — ops-plane emitter stays dark"
+          fi
 
   migrate:
     name: DB migrate (one-off ECS task — BEFORE the flip)
@@ -442,7 +486,7 @@ jobs:
 
   cdk_finalize:
     name: CDK finalize (real task defs + flip — after migrate)
-    needs: [cdk, migrate]
+    needs: [cdk, migrate, seed_secrets]
     if: ${{ always() && needs.cdk.result == 'success' && needs.migrate.result == 'success' }}
     runs-on: ubuntu-latest
     environment: ${{ inputs.env_name }}
@@ -461,15 +505,33 @@ jobs:
           VPN_CIDRS: ${{ inputs.vpn_cidrs }}
           ALB_CERT_ARN: ${{ inputs.alb_cert_arn }}
           WILDCARD_CERT_ARN: ${{ inputs.wildcard_cert_arn }}
+          DEPLOY_ROLE_ARN: ${{ secrets.AWS_DEPLOY_ROLE }}
         run: |
           set -euo pipefail
           PREFIX="CDK_$(echo "$ENV_NAME" | tr 'a-z-' 'A-Z_')"
+          # Guard: the cert inputs must be a single-line ACM cert ARN (or empty for
+          # the optional WILDCARD). The most common mis-config is pasting the Auth0
+          # JSON into a *_CERT_ARN var; a multi-line value then fails the $GITHUB_ENV
+          # write with a cryptic "Invalid format" error, so catch it with a clear one.
+          for name in ALB_CERT_ARN WILDCARD_CERT_ARN; do
+            val="${!name}"
+            [ -z "$val" ] && continue
+            if [ "$(printf '%s' "$val" | wc -l | tr -d ' ')" != "0" ]; then
+              echo "::error::${name} is multi-line. It must be a single ACM certificate ARN (arn:...:acm:...), not JSON. If you pasted the Auth0 config here, move it to GENESIS_PROD_SECRETS_JSON / GENESIS_STAGING_SECRETS_JSON and set ${name} to a cert ARN or leave it empty."
+              exit 1
+            fi
+            case "$val" in
+              arn:*:acm:*) : ;;
+              *) echo "::error::${name}='${val}' is not an ACM certificate ARN (expected arn:...:acm:...). Set a cert ARN, or leave it empty if unused."; exit 1 ;;
+            esac
+          done
           {
             echo "${PREFIX}_ACCOUNT=$ACCOUNT"
             echo "${PREFIX}_REGION=$REGION"
             echo "${PREFIX}_VPN_CIDRS=$VPN_CIDRS"
             echo "${PREFIX}_ALB_CERT_ARN=$ALB_CERT_ARN"
             echo "${PREFIX}_WILDCARD_CERT_ARN=$WILDCARD_CERT_ARN"
+            echo "CDK_DEPLOY_ROLE_ARN=$DEPLOY_ROLE_ARN"
           } >> "$GITHUB_ENV"
           echo "exported ${PREFIX}_{ACCOUNT,REGION,VPN_CIDRS,ALB_CERT_ARN,WILDCARD_CERT_ARN}"
       - name: Install infra deps (standalone — no monorepo)
@@ -479,6 +541,16 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE }}
           aws-region: ${{ inputs.region }}
+      - name: Wire ops-plane HMAC ARN (from seed_secrets; emitter stays dark if absent)
+        if: needs.seed_secrets.outputs.ops_hmac_arn != ''
+        env:
+          ENV_NAME: ${{ inputs.env_name }}
+          OPS_HMAC_ARN: ${{ needs.seed_secrets.outputs.ops_hmac_arn }}
+        run: |
+          set -euo pipefail
+          PREFIX="CDK_$(echo "$ENV_NAME" | tr 'a-z-' 'A-Z_')"
+          echo "${PREFIX}_OPS_HMAC_SECRET_ARN=$OPS_HMAC_ARN" >> "$GITHUB_ENV"
+          echo "ops-plane emitter ON: ${PREFIX}_OPS_HMAC_SECRET_ARN -> $OPS_HMAC_ARN"
       - name: CDK deploy (real task definitions + flip)
         working-directory: infra
         run: |
