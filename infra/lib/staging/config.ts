@@ -801,6 +801,18 @@ const bedrockModels: readonly string[] = [
   "anthropic.claude-haiku-4-5-20251001-v1:0",
 ];
 
+// Cross-account ops-emitter HMAC ARNs for the Genesis envs. Unlike axira-los
+// (same AWS account as the receiver → hard-coded ARN), the Genesis workflow-
+// engine signs with a secret in GENESIS's OWN account, so the ARN is account-
+// specific and supplied at deploy time via these vars. Until a var is set, the
+// env's opsEmitter block is omitted entirely — the env ships "dark" (no emit
+// attempts, no broken signing) and lights up once the ARN is wired at receiver
+// onboarding. See playbooks/onboard-an-ops-plane-customer.md.
+const GENESIS_PROD_OPS_HMAC_ARN =
+  process.env["CDK_GENESIS_PROD_OPS_HMAC_SECRET_ARN"];
+const GENESIS_PROD_STAGING_OPS_HMAC_ARN =
+  process.env["CDK_GENESIS_PROD_STAGING_OPS_HMAC_SECRET_ARN"];
+
 const ENVS: Record<EnvName, EnvConfig> = {
   "axira-staging": {
     name: "axira-staging",
@@ -1164,6 +1176,31 @@ const ENVS: Record<EnvName, EnvConfig> = {
       ebsVolumeGiB: 100,
     },
     opsPlane: { opsSubdomain: "ops", consoleSubdomain: "console" },
+    // Customer-side ops-emitter → Axira ops-plane (genesis-prod customer).
+    // CROSS-ACCOUNT: the wfe signs with an HMAC secret in GENESIS's own account
+    // (the receiver holds its own copy to verify). ARN is supplied via
+    // CDK_GENESIS_PROD_OPS_HMAC_SECRET_ARN; the block is omitted (env ships dark)
+    // until that var is set at receiver onboarding. Emits to the public prod
+    // receiver ops.axiralabs.ai. Mirrors the axira-los block; same 6 health URLs.
+    ...(GENESIS_PROD_OPS_HMAC_ARN
+      ? {
+          opsEmitter: {
+            endpoint: "https://ops.axiralabs.ai",
+            customerSlug: "genesis-prod",
+            hmacSecretArn: GENESIS_PROD_OPS_HMAC_ARN,
+            errorGroupsEnabled: true,
+            infraSignalCollectorEnabled: true,
+            serviceHealthUrls: [
+              "gateway=http://gateway.axira.internal:3001/health",
+              "agent-runtime=http://agent-runtime.axira.internal:3002/health",
+              "experience=http://experience.axira.internal:3000/api/health",
+              "workflow-engine=http://workflow-engine.axira.internal:3003/health",
+              "admin-hub=http://admin-hub.axira.internal:3010/api/health",
+              "observability-alert-runner=http://alert-runner.axira.internal:3014/health",
+            ].join(","),
+          },
+        }
+      : {}),
     phoenixEndpoint: "https://phoenix.axira.local/v1/traces",
     featureFlags: {
       cedarAuthzEnabled: true,
@@ -1346,6 +1383,29 @@ const ENVS: Record<EnvName, EnvConfig> = {
       ebsVolumeGiB: 50,
     },
     opsPlane: { opsSubdomain: "ops", consoleSubdomain: "console" },
+    // Customer-side ops-emitter → Axira ops-plane (genesis-prod-staging customer).
+    // CROSS-ACCOUNT (see genesis-prod). Emits to the STAGING receiver
+    // ops-staging.axiralabs.ai; ARN via CDK_GENESIS_PROD_STAGING_OPS_HMAC_SECRET_ARN,
+    // block omitted (ships dark) until that var is set at receiver onboarding.
+    ...(GENESIS_PROD_STAGING_OPS_HMAC_ARN
+      ? {
+          opsEmitter: {
+            endpoint: "https://ops-staging.axiralabs.ai",
+            customerSlug: "genesis-prod-staging",
+            hmacSecretArn: GENESIS_PROD_STAGING_OPS_HMAC_ARN,
+            errorGroupsEnabled: true,
+            infraSignalCollectorEnabled: true,
+            serviceHealthUrls: [
+              "gateway=http://gateway.axira.internal:3001/health",
+              "agent-runtime=http://agent-runtime.axira.internal:3002/health",
+              "experience=http://experience.axira.internal:3000/api/health",
+              "workflow-engine=http://workflow-engine.axira.internal:3003/health",
+              "admin-hub=http://admin-hub.axira.internal:3010/api/health",
+              "observability-alert-runner=http://alert-runner.axira.internal:3014/health",
+            ].join(","),
+          },
+        }
+      : {}),
     phoenixEndpoint: "https://phoenix.axira.local/v1/traces",
     featureFlags: {
       cedarAuthzEnabled: true,
@@ -1596,6 +1656,30 @@ const ENVS: Record<EnvName, EnvConfig> = {
       ebsVolumeGiB: 100,
     },
     opsPlane: { opsSubdomain: "ops", consoleSubdomain: "console" },
+    // Customer-side ops-emitter → Axira ops-plane (axira-los PROD customer).
+    // Mirrors axira-los-staging with prod endpoint + slug + HMAC. Codifies the
+    // workflow-engine env so a `cdk deploy` keeps the prod console's
+    // Services / Errors / Incidents feed wired (no hand-patching). Emits over
+    // the public receiver (ops.axiralabs.ai), IP-locked to this env's NAT EIPs.
+    opsEmitter: {
+      endpoint: "https://ops.axiralabs.ai",
+      customerSlug: "axira-los",
+      hmacSecretArn:
+        process.env["CDK_AXIRA_LOS_OPS_HMAC_SECRET_ARN"] ??
+        "arn:aws:secretsmanager:us-west-2:000000000000:secret:axira-ops/production/customer/axira-los/hmac-tJXRUu",
+      errorGroupsEnabled: true,
+      infraSignalCollectorEnabled: true,
+      // Same in-cluster health URLs as staging: the axira.internal Cloud Map
+      // namespace is per-VPC, so the prod cluster resolves the identical names.
+      serviceHealthUrls: [
+        "gateway=http://gateway.axira.internal:3001/health",
+        "agent-runtime=http://agent-runtime.axira.internal:3002/health",
+        "experience=http://experience.axira.internal:3000/api/health",
+        "workflow-engine=http://workflow-engine.axira.internal:3003/health",
+        "admin-hub=http://admin-hub.axira.internal:3010/api/health",
+        "observability-alert-runner=http://alert-runner.axira.internal:3014/health",
+      ].join(","),
+    },
     phoenixEndpoint: "https://phoenix.axira.local/v1/traces",
     featureFlags: {
       cedarAuthzEnabled: true,

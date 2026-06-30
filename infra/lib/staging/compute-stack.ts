@@ -556,7 +556,14 @@ export class ComputeStack extends cdk.Stack {
       );
     }
 
-    // AppConfig access for runtime feature flags.
+    // AppConfig DATA-plane access — runtime feature-flag reads (rulebook poller +
+    // user-profile lane). The data plane authorizes against the *retrieval* ARN
+    // `application/<app>/environment/<env>/configuration/<profile>` (note
+    // `configuration`, nested under the environment) — NOT the control-plane
+    // `application/<app>/configurationprofile/<profile>` ARN. Granting the latter
+    // for StartConfigurationSession/GetLatestConfiguration never matches, so the
+    // poller logs "not authorized to perform appconfig:StartConfigurationSession".
+    // Wildcard the profile so per-tenant profiles (created at runtime) are covered.
     taskRole.addToPolicy(
       new iam.PolicyStatement({
         actions: [
@@ -564,10 +571,41 @@ export class ComputeStack extends cdk.Stack {
           "appconfig:GetLatestConfiguration",
         ],
         resources: [
+          `arn:aws:appconfig:${this.region}:${this.account}:application/${this.appConfigIds.applicationId}/environment/${this.appConfigIds.environmentId}/configuration/*`,
+        ],
+      }),
+    );
+
+    // AppConfig CONTROL-plane access — the Admin Hub flag-management lane
+    // (gateway → agent-runtime `/api/v1/admin/appconfig-flags/*`) reads + writes
+    // hosted configuration versions, lists environments/strategies, starts
+    // deployments, and creates per-tenant profiles. Without this the admin list
+    // route's ListHostedConfigurationVersions call is denied, the handler throws,
+    // and the Feature Flags page fails with HTTP 500. Scoped to this env's
+    // application, its environment, and its (current + per-tenant) profiles;
+    // ListDeploymentStrategies is account-level so it takes `*`.
+    taskRole.addToPolicy(
+      new iam.PolicyStatement({
+        actions: [
+          "appconfig:ListHostedConfigurationVersions",
+          "appconfig:GetHostedConfigurationVersion",
+          "appconfig:CreateHostedConfigurationVersion",
+          "appconfig:CreateConfigurationProfile",
+          "appconfig:ListEnvironments",
+          "appconfig:StartDeployment",
+        ],
+        resources: [
           `arn:aws:appconfig:${this.region}:${this.account}:application/${this.appConfigIds.applicationId}`,
           `arn:aws:appconfig:${this.region}:${this.account}:application/${this.appConfigIds.applicationId}/environment/${this.appConfigIds.environmentId}`,
-          `arn:aws:appconfig:${this.region}:${this.account}:application/${this.appConfigIds.applicationId}/configurationprofile/${this.appConfigIds.featureFlagsProfileId}`,
+          `arn:aws:appconfig:${this.region}:${this.account}:application/${this.appConfigIds.applicationId}/configurationprofile/*`,
         ],
+      }),
+    );
+    // ListDeploymentStrategies is not resource-scoped (account-wide list).
+    taskRole.addToPolicy(
+      new iam.PolicyStatement({
+        actions: ["appconfig:ListDeploymentStrategies"],
+        resources: ["*"],
       }),
     );
 
